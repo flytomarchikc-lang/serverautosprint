@@ -7,34 +7,39 @@ app.use(express.json());
 
 const activePlayers = new Map();
 
-// ДОБАВЬ СЮДА СВОИ UUID И НИКИ!
-const playerRanks = {
-    // UUID (для лицензии)
-    "36a8dcbc-5895-4e4b-b4e3-3868817546d1": "CREATOR_TESTER",
-    
-    // Ники (для пиратки)
-    "flytomarchik": "CREATOR_TESTER",
-    "TestPlayer": "TESTER"
-};
-
 setInterval(() => {
     const now = Date.now();
-    for (const [id, data] of activePlayers.entries()) {
-        if (now - data.timestamp > 120000) {
-            activePlayers.delete(id);
-            console.log(`Removed inactive: ${id}`);
+    for (const [uuid, timestamp] of activePlayers.entries()) {
+        if (now - timestamp > 120000) {
+            activePlayers.delete(uuid);
+            console.log(`Removed inactive: ${uuid}`);
         }
     }
 }, 30000);
 
 app.post('/heartbeat', (req, res) => {
-    const { uuid, username } = req.body;
-    
-    console.log('Heartbeat received:', { uuid, username });
-    
-    if (!uuid && !username) {
-        return res.status(400).json({ error: 'UUID or username required' });
-    }
+    const { uuid } = req.body;
+    if (!uuid) return res.status(400).json({ error: 'UUID required' });
+
+    activePlayers.set(uuid, Date.now());
+    console.log(`Heartbeat: ${uuid}`);
+    res.json({ success: true, count: activePlayers.size });
+});
+
+app.get('/players', (req, res) => {
+    const players = Array.from(activePlayers.keys());
+    res.json({ players });
+});
+
+app.get('/player/:uuid', (req, res) => {
+    const hasMod = activePlayers.has(req.params.uuid);
+    res.json({ uuid: req.params.uuid, hasMod });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`AutoSprint API running on port ${PORT}`);
+});
     
     const playerId = uuid || username;
     
@@ -77,3 +82,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`AutoSprint API running on port ${PORT}`);
 });
+
