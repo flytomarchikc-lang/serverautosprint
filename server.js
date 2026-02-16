@@ -7,16 +7,10 @@ app.use(express.json());
 
 const activePlayers = new Map();
 
-
-const SPECIAL_ROLES = {
-    "36a8dcbc-5895-4e4b-b4e3-3868817546d1": "DEVELOPER",
-    "4822eb4d-7fc4-4d9d-bd7c-af7a68e8a9a4": "TESTER"
-};
-
 setInterval(() => {
     const now = Date.now();
     for (const [uuid, timestamp] of activePlayers.entries()) {
-        if (now - timestamp > 120000) { // Удаляем через 2 мин инактива
+        if (now - timestamp > 120000) {
             activePlayers.delete(uuid);
             console.log(`Removed inactive: ${uuid}`);
         }
@@ -28,26 +22,18 @@ app.post('/heartbeat', (req, res) => {
     if (!uuid) return res.status(400).json({ error: 'UUID required' });
 
     activePlayers.set(uuid, Date.now());
-    // console.log(`Heartbeat: ${uuid}`);
-    res.json({ success: true });
+    console.log(`Heartbeat: ${uuid}`);
+    res.json({ success: true, count: activePlayers.size });
 });
 
 app.get('/players', (req, res) => {
-    const playersList = [];
+    const players = Array.from(activePlayers.keys());
+    res.json({ players });
+});
 
-    for (const uuid of activePlayers.keys()) {
-
-        let role = "DEFAULT";
-
-
-        if (SPECIAL_ROLES[uuid]) {
-            role = SPECIAL_ROLES[uuid];
-        }
-
-        playersList.push({ uuid: uuid, role: role });
-    }
-
-    res.json({ players: playersList });
+app.get('/player/:uuid', (req, res) => {
+    const hasMod = activePlayers.has(req.params.uuid);
+    res.json({ uuid: req.params.uuid, hasMod });
 });
 
 const PORT = process.env.PORT || 3000;
