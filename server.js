@@ -1,42 +1,33 @@
 const express = require('express');
-const http    = require('http');
-const WebSocket = require('ws');
-const cors    = require('cors');
+const { WebSocketServer, WebSocket } = require('ws');
+const http = require('http');
+const cors = require('cors');
 
-const app    = express();
-const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
-
+const app = express();
 app.use(cors());
 app.use(express.json());
 
-// activePlayers: uuid → { timestamp, username }
-const activePlayers = new Map();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-// ircClients: uuid → { ws, username }
-const ircClients = new Map();
+// ─── REST: heartbeat ─────────────────────────────────────────────────────────
+const activePlayers = new Map(); // uuid -> { timestamp, username }
 
-// ─── Очистка неактивных ───────────────────────────────────────────────────────
 setInterval(() => {
     const now = Date.now();
     for (const [uuid, data] of activePlayers.entries()) {
-        if (now - data.timestamp > 120_000) {
+        if (now - data.timestamp > 120000) {
             activePlayers.delete(uuid);
-            console.log(`[API] Removed inactive: ${data.username} (${uuid})`);
+            console.log(`[API] Removed inactive: ${uuid}`);
         }
     }
-}, 30_000);
-
-// ─── REST ─────────────────────────────────────────────────────────────────────
+}, 30000);
 
 app.post('/heartbeat', (req, res) => {
     const { uuid, username } = req.body;
     if (!uuid) return res.status(400).json({ error: 'UUID required' });
-    const name  = username || uuid;
-    const isNew = !activePlayers.has(uuid);
-    activePlayers.set(uuid, { timestamp: Date.now(), username: name });
-    console.log(`[API] Heartbeat: ${name}`);
-    if (isNew) broadcastIRC(null, { type: 'user_join', uuid, username: name });
+    activePlayers.set(uuid, { timestamp: Date.now(), username: username || 'Unknown' });
+    console.log(`[API] Heartbeat: ${uuid}`);
     res.json({ success: true, count: activePlayers.size });
 });
 
@@ -49,75 +40,123 @@ app.get('/player/:uuid', (req, res) => {
 });
 
 // ─── WebSocket IRC ────────────────────────────────────────────────────────────
+// ws -> { uuid, username }
+const chatClients = new Map();
+
+// Пинг каждые 25 сек чтобы Railway не закрывал соединение
+const PING_INTERVAL = 25000;
 
 wss.on('connection', (ws) => {
-    let playerUUID = null;
-    let playerName = null;
-    let authed     = false;
+    console.log('[IRC] New connection');
+
+    // Keepalive ping
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (raw) => {
+        let msg;
         try {
-            const msg = JSON.parse(raw.toString());
-
-            if (msg.type === 'auth') {
-                const uuid = msg.uuid;
-                const name = msg.username || uuid;
-                if (!activePlayers.has(uuid)) {
-                    send(ws, { type: 'error', message: 'Not recognized. Send heartbeat first.' });
-                    ws.close(4001, 'Unauthorized');
-                    return;
-                }
-                // Вытолкнуть старое соединение
-                if (ircClients.has(uuid)) {
-                    try { ircClients.get(uuid).ws.close(4002, 'Replaced'); } catch (_) {}
-                }
-                playerUUID = uuid; playerName = name; authed = true;
-                ircClients.set(uuid, { ws, username: name });
-                send(ws, { type: 'auth_ok' });
-                console.log(`[IRC] Authed: ${name} | online: ${ircClients.size}`);
-                broadcastIRC(uuid, { type: 'user_join', uuid, username: name });
-                return;
-            }
-
-            if (!authed) { send(ws, { type: 'error', message: 'Not authenticated' }); return; }
-
-            if (msg.type === 'chat') {
-                const text = String(msg.message || '').trim().slice(0, 512);
-                if (!text) return;
-                const chatMsg = { type: 'chat', uuid: playerUUID, username: playerName, message: text, timestamp: Date.now() };
-                console.log(`[IRC] ${playerName}: ${text}`);
-                broadcastIRC(null, chatMsg);
-            }
+            msg = JSON.parse(raw.toString()); // toString() важен для Buffer
         } catch (e) {
-            console.error('[IRC] Parse error:', e.message);
+            console.error('[IRC] Bad JSON:', raw.toString());
+            return;
+        }
+
+        console.log('[IRC] Received packet type:', msg.type); // debug
+
+        switch (msg.type) {
+            case 'auth': {
+                const { uuid, username } = msg;
+                if (!uuid || !username) { ws.close(); return; }
+                chatClients.set(ws, { uuid, username });
+                console.log(`[IRC] Authed: ${username} | online: ${chatClients.size}`);
+
+                ws.send(JSON.stringify({
+                    type: 'system',
+                    text: `§aДобро пожаловать в AutoSprint IRC, §f${username}§a!`
+                }));
+
+                broadcast({
+                    type: 'system',
+                    text: `§7${username} §aподключился к IRC`
+                }, ws);
+                break;
+            }
+
+            case 'message': {
+                const client = chatClients.get(ws);
+                if (!client) { console.warn('[IRC] message from unauthed ws'); return; }
+
+                const text = (msg.text || '').trim().substring(0, 256);
+                if (!text) break;
+
+                console.log(`[IRC] ${client.username}: ${text}`);
+
+                const packet = {
+                    type: 'chat',
+                    uuid: client.uuid,
+                    username: client.username,
+                    text,
+                    timestamp: Date.now()
+                };
+                broadcast(packet); // всем включая отправителя
+                break;
+            }
+
+            case 'ping': {
+                ws.send(JSON.stringify({ type: 'pong' }));
+                break;
+            }
+
+            default:
+                console.log('[IRC] Unknown packet type:', msg.type);
         }
     });
 
-    ws.on('close', () => {
-        if (authed && playerUUID) {
-            ircClients.delete(playerUUID);
-            console.log(`[IRC] Left: ${playerName} | online: ${ircClients.size}`);
-            broadcastIRC(playerUUID, { type: 'user_leave', uuid: playerUUID, username: playerName });
+    ws.on('close', (code, reason) => {
+        const client = chatClients.get(ws);
+        if (client) {
+            console.log(`[IRC] Left: ${client.username} | online: ${chatClients.size - 1}`);
+            chatClients.delete(ws);
+            broadcast({
+                type: 'system',
+                text: `§7${client.username} §cотключился от IRC`
+            });
         }
     });
 
-    ws.on('error', (err) => console.error(`[IRC] Error (${playerName || '?'}):`, err.message));
+    ws.on('error', (err) => {
+        console.error('[IRC] WS error:', err.message);
+        chatClients.delete(ws);
+    });
 });
 
-function send(ws, obj) {
-    try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); } catch (_) {}
-}
+// Проверяем живость соединений каждые 25 сек
+const pingInterval = setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (ws.isAlive === false) {
+            console.log('[IRC] Terminating dead connection');
+            chatClients.delete(ws);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, PING_INTERVAL);
 
-function broadcastIRC(excludeUUID, obj) {
-    const payload = JSON.stringify(obj);
-    for (const [uuid, { ws }] of ircClients.entries()) {
-        if (uuid === excludeUUID) continue;
-        try { if (ws.readyState === WebSocket.OPEN) ws.send(payload); } catch (_) {}
+wss.on('close', () => clearInterval(pingInterval));
+
+function broadcast(packet, exclude = null) {
+    const data = JSON.stringify(packet);
+    for (const [ws] of chatClients) {
+        if (ws !== exclude && ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+        }
     }
 }
 
-// ─── Старт ────────────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`AutoSprint API + IRC running on port ${PORT}`));
-
-
+server.listen(PORT, () => {
+    console.log(`AutoSprint API + IRC running on port ${PORT}`);
+});
